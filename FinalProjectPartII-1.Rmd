@@ -1,0 +1,416 @@
+---
+title: "FinalProjectPartII"
+author: "Javier Mencia"
+date: "2024-03-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(epiDisplay) 
+library(glmnet)
+
+```
+
+Data import
+```{r}
+accidents <- read.csv('Accidents.csv')
+bikers <- read.csv('Bikers.csv')
+data <- merge(accidents, bikers, by = "Accident_Index")
+
+
+# Set seed for reproducibility
+set.seed(1008476114)
+
+# Generate a vector of row indices for the training set
+
+train_indices <- sample(nrow(data), 0.5 * nrow(data))  # 50% for training, adjust as needed
+
+# Create the testing set (remaining rows not in the training set)
+
+test_set <- data[-train_indices, ]
+
+# Create the training set
+
+data <- data[train_indices, ]
+```
+
+
+Data cleaning
+```{r}
+
+cols_to_exclude <- setdiff(names(data), "Date")
+
+# Replace "Unknown" with NA in columns except for "Date"
+data[, cols_to_exclude][data[, cols_to_exclude] == "Unknown" | data[, cols_to_exclude]=="Other" | data[, cols_to_exclude]=="Missing data"| data[, cols_to_exclude]=="Missing Data"] <- NA
+
+# Check the missing values for each column
+initialrow<- nrow(data)
+sapply(data, function(x)sum(is.na(x)))
+
+
+```
+
+
+```{r}
+#Delete missing data
+data<- na.omit(data)
+completerows<- nrow(data)
+#See proportion of data that was removed
+(initialrow-completerows)/completerows
+initialrow-completerows
+```
+
+
+Data Wrangling
+
+Change format of some of the data
+```{r}
+data<- data %>%
+  mutate(Severity = ifelse(Severity %in% c("Fatal"), 1, 0))%>%
+  mutate(Age_Grp = ifelse(Age_Grp == "6 to 10", "06 to 10", Age_Grp))%>%
+  mutate(Gender = ifelse(Gender=="Male", 1, 0))%>%filter(Speed_limit != 660)
+
+head(data)
+```
+
+Now create a new variable for time of day:
+```{r}
+time_to_seconds <- function(time_str) {
+  time_parts <- strsplit(time_str, ":")[[1]]  # Split time string into hours and minutes
+  hours <- as.numeric(time_parts[1])  # Extract hours
+  minutes <- as.numeric(time_parts[2])  # Extract minutes
+  
+  seconds <- hours * 3600 + minutes * 60  # Convert hours and minutes to seconds
+  return(seconds)
+}
+
+# Apply the function to the 'Time' column and create a new column 'time_data' with the number of seconds
+time_data <- sapply(data$Time, time_to_seconds)
+
+
+# Use case_when() to categorize time into intervals
+data$TimeDay <- case_when(
+  time_data < 6 * 3600 | time_data >22 * 3600~ "Night",
+  time_data < 9 * 3600 ~ "Morning",
+  time_data < 14 * 3600 ~ "Midday",
+  time_data < 18 * 3600 ~ "Afternoon",
+TRUE ~ "Evening"
+)
+data <- data %>%
+  mutate(Weekend = ifelse(Day %in% c("Saturday", "Sunday"), 1, 0))
+```
+
+
+Make data usable:
+```{r}
+#cleandata <- data%>% #Select variables
+#  dplyr::select(Severity, Age_Grp,  Number_of_Casualties, Number_of_Vehicles, Weather_conditions, , Road_type, Speed_limit, Gender, Time, Weekend, TimeDay)
+
+data<- subset(data, select = -c(Date, Accident_Index, Time))
+#Removing accident index, because it does not contain any information on the accident
+#We created a variable for Time of Day, so we can remove time
+#We coded a variable for weekend or not so we can remove day
+#Date should also be removed as it is in date format
+head(data)
+
+```
+
+```{r}
+data$Road_conditions <- factor(data$Road_conditions)
+data$Weather_conditions <- factor(data$Weather_conditions)
+data$Light_conditions <- factor(data$Light_conditions)
+data$Road_type <- factor(data$Road_type)
+data$TimeDay <- factor(data$TimeDay)
+data$Age_Grp <- factor(data$Age_Grp)
+
+head(data)
+```
+
+
+
+
+```{r}
+#Combine Age Groups into less groups:
+data <- data %>%
+  mutate(Age_Grp = case_when(
+    Age_Grp %in% c("06 to 10", "11 to 15", "16 to 20") ~ "under 21",
+    Age_Grp %in% c("21 to 25", "26 to 35", "36 to 45", "46 to 55") ~ "21 to 55",
+    Age_Grp %in% c("56 to 65", "66 to 75") ~ "over 55",
+    TRUE ~ as.character(Age_Grp)
+    
+  )) %>% 
+  mutate(DualCarriageway=ifelse(Road_type == "Dual carriageway", 1, 0))
+
+encoded_data <- data.frame(data)
+encoded_data <- subset(encoded_data, select = -c(Road_conditions, Weather_conditions, Road_type, Number_of_Vehicles, Number_of_Casualties, Day))
+
+summary(encoded_data)
+
+```
+
+```{r}
+data_summary <- data %>%
+  group_by(Age_Grp) %>%
+  summarise(
+    count = n(),  # Count of observations in each Age Group
+    relative_frequency = n() / nrow(data),  # Relative frequency of each Age Group
+    fatality_rate = mean(Severity)  # Fatality rate of each Age Group
+  )
+
+# Print the summary table
+print(data_summary)
+```
+
+```{r}
+
+data$Speed_limit_rounded <- round(data$Speed_limit, -1)
+
+# Calculate the total number of accidents and fatality rate for each rounded speed limit
+speed_summary <- data %>%
+  group_by(Speed_limit_rounded) %>%
+  summarise(total_accidents = n(),
+            fatality_rate = mean(Severity) * 100) %>%  # Fatality rate in percentage
+  arrange(Speed_limit_rounded)  # Arrange by rounded speed limit
+
+# Create the bar chart
+ggplot(speed_summary, aes(x = factor(Speed_limit_rounded), y = total_accidents, fill = NULL)) +
+  geom_bar(stat = "identity", fill ="#0E1854") +
+  geom_text(aes(label = paste0(round(fatality_rate, 1), "%")),
+            vjust = -0.5, size = 3, color = "black") +  # Add labels for fatality rate
+  labs(x = "Speed Limit (Rounded)", y = "Total Accidents", fill = NULL, 
+       title = "Total Accidents and Fatality Rate by Rounded Speed Limit (Fatality rate%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+data<-data[, !(names(data) %in% c("Speed_limit_rounded"))]
+```
+```{r}
+day_order <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+# Calculate the total number of accidents and fatality rate for each day of the week
+accidents_summary <- data %>%
+  group_by(Day) %>%
+  summarise(total_accidents = n(),
+            fatality_rate = mean(Severity) * 100) %>%  # Fatality rate in percentage
+  arrange(factor(Day, levels = day_order))  # Arrange by the specified order of days
+
+# Create the bar chart
+ggplot(accidents_summary, aes(x = factor(Day, levels = day_order), y = total_accidents,
+    fill = Day)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(round(fatality_rate, 1), "%")),
+            vjust = -0.5, size = 3, color = "black") +  # Add labels for fatality rate
+  labs(x = "Day of the Week", y = "Total Accidents", fill = NULL, 
+       title = "Total Accidents and Fatality Rate by Day of the Week (Fatality rate%)") +
+  theme_minimal() +
+  scale_fill_manual(values = c(
+    '#0E1854',
+    '#0E1854',
+    '#FDAF01',
+    '#FDAF01',
+    '#0E1854',
+    '#0E1854',
+    '#0E1854'
+  )) +  # Set the same color for all bars
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+Fit a full model
+```{r}
+logit.mod1 <- glm(Severity ~ ., family = binomial(link = logit), data = encoded_data)
+summary(logit.mod1)
+```
+We see that both our predictors of interest are significant, as well as three others: Age over 55, the accident taking place with no light and the accident taking place at night.
+
+
+
+
+For more specific variable selection use AIC and BIC with stepwise selection and also use Elastic net and compare them.
+
+Use AIC first:
+```{r, eval=TRUE, echo = T}
+## Stepwise elimination based on AIC ##
+sel.var.aic <- step(logit.mod1, trace = 0, k = 2, direction = "both")
+sel.var.aic
+select_var_aic<-attr(terms(sel.var.aic), "term.labels")   
+select_var_aic
+```
+
+Now BIC
+```{r, eval=TRUE, echo = T}
+## Stepwise elimination based on BIC ##
+sel.var.bic <- step(logit.mod1, trace = 0, k = log(nrow(encoded_data)), direction = "both") 
+sel.var.bic
+select_var_bic<-attr(terms(sel.var.bic), "term.labels")   
+select_var_bic
+```
+
+COmpare them with LRT:
+```{r}
+library(openintro)
+
+modAIC <- glm(Severity ~ ., data = encoded_data[,which(colnames(encoded_data) %in% c(select_var_aic, "Severity"))], family = binomial(link = logit))
+modBIC <- glm(Severity ~ ., data = encoded_data[,which(colnames(encoded_data) %in% c(select_var_bic, "Severity"))], family = binomial(link = logit),)
+
+lrtest(modAIC, modBIC)
+```
+This p-value tells us that we should NOT reject the null hypothesis in the Likelihood ratio test (greater than the 0.05 cutoff) and conclude that the simpler model selected by BIC provides a better fit for the data than the more complex model from AIC that includes Weekend.
+
+Now select AIC model and compare it with Elastic Net's selection
+
+
+```{r}
+selected_data <- encoded_data[, c("Severity", select_var_bic)]
+
+# Specify the columns containing categorical variables
+categorical_columns <- c("Light_conditions", "Age_Grp", "TimeDay")
+
+# Convert categorical variables to factors
+selected_data[categorical_columns] <- lapply(selected_data[categorical_columns], factor)
+
+# Convert the subsetted dataframe to matrix format with dummy variables
+X <- model.matrix(~ . - Severity, data = selected_data)
+
+# Extract the response variable (y)
+y <- selected_data$Severity
+
+
+# Fit Lasso model with cross-validation
+cv.out <- cv.glmnet(x = X, y = y, alpha = 0.5)
+
+plot(cv.out)
+best.lambda <- cv.out$lambda.1se
+best.lambda
+co <- coef(cv.out, s = "lambda.1se")
+
+# Selection of the significant features (predictors)
+## threshold for variable selection ##
+thresh <- 0.00
+# select variables #
+inds <- which(abs(co) > thresh)
+variables <- row.names(co)[inds]
+sel.var.lasso <- variables[!(variables %in% '(Intercept)')]
+sel.var.lasso
+```
+
+
+We notice that elastic net only chooses one variable, namely Speed limit. This was also chosen by AIC and BIC which shows that it is a highly significant predictor
+
+
+Now do some model calibration:
+```{r}
+library(rms)
+
+## Fit the final model with lrm from rms package using variables from BIC ##
+lrm.final <- lrm(Severity ~ Speed_limit+Light_conditions+Age_Grp+TimeDay+DualCarriageway, data = encoded_data, x =TRUE, y = TRUE, model= T)
+
+#Fit also model from AIC selection and Elastic Net
+lrm.aic <- lrm(Severity ~ Speed_limit+Light_conditions+Age_Grp+TimeDay+DualCarriageway+Weekend, data = encoded_data, x =TRUE, y = TRUE, model= T)
+
+lrm.en <- lrm(Severity ~ Speed_limit, data = encoded_data, x =TRUE, y = TRUE, model= T)
+
+
+
+
+cross.calib <- calibrate(lrm.final, method="crossvalidation", B=8) # model calibration
+plot(cross.calib, las=1, xlab = "Predicted Probability")
+```
+
+
+Now plot the AUC curve for the model
+
+```{r}
+library(pROC)
+p <- predict(lrm.final, type = "fitted")
+
+roc_logit <- roc(selected_data$Severity ~ p)
+## The True Positive Rate ##
+TPR <- roc_logit$sensitivities
+## The False Positive Rate ##
+FPR <- 1 - roc_logit$specificities
+
+plot(FPR, TPR, xlim = c(0,1), ylim = c(0,1), type = 'l', lty = 1, lwd = 2,col = 'red')
+abline(a = 0, b = 1, lty = 2, col = 'blue')
+text(0.7,0.4,label = paste("AUC = ", round(auc(roc_logit),2)))
+
+auc(roc_logit)
+```
+We obtained an AUC of 0.76 which suggests the model has a good discrimination ability
+
+Look at AUC of modAIC model
+```{r}
+p <- predict(lrm.aic, type = "fitted")
+
+roc_logit <- roc(selected_data$Severity ~ p)
+## The True Positive Rate ##
+TPR <- roc_logit$sensitivities
+## The False Positive Rate ##
+FPR <- 1 - roc_logit$specificities
+
+plot(FPR, TPR, xlim = c(0,1), ylim = c(0,1), type = 'l', lty = 1, lwd = 2,col = 'red')
+abline(a = 0, b = 1, lty = 2, col = 'blue')
+text(0.7,0.4,label = paste("AUC = ", round(auc(roc_logit),2)))
+
+auc(roc_logit)
+```
+```{r}
+p <- predict(lrm.en, type = "fitted")
+
+roc_logit <- roc(selected_data$Severity ~ p)
+## The True Positive Rate ##
+TPR <- roc_logit$sensitivities
+## The False Positive Rate ##
+FPR <- 1 - roc_logit$specificities
+
+plot(FPR, TPR, xlim = c(0,1), ylim = c(0,1), type = 'l', lty = 1, lwd = 2,col = 'red')
+abline(a = 0, b = 1, lty = 2, col = 'blue')
+text(0.7,0.4,label = paste("AUC = ", round(auc(roc_logit),2)))
+
+auc(roc_logit)
+```
+Also AIC has the highest AUC out of all three models, so we will choose it.
+
+Now look for influential observations using Cook's Distance
+```{r}
+# Calculate Cook's distance
+cooksd <- cooks.distance(modBIC)
+
+
+
+# Find influential observations (those with Cook's distance > threshold)
+threshold <- 4 / (nrow(encoded_data) - length(coef(lrm.final)) - 1)
+influential_obs <- which(cooksd > threshold)
+
+print(length(influential_obs))
+
+# Plot Cook's distance
+plot(cooksd, pch = 19, frame = FALSE, xlab = "Observation", ylab = "Cook's Distance", main = "Cook's Distance Plot")
+abline(h = threshold, col = "red")  # Add threshold line
+
+```
+
+
+
+
+We see that almost 4000 observations were marked as influential, but we have almost 400000 observations so this is less than 1%, for the context of this investigation, we will keep them to ensure the results are more generalizable
+
+```{r}
+nrow(encoded_data)
+```
+
+```{r}
+# Calculate leverage values
+leverage <- hatvalues(modBIC)
+
+# Plot leverage values
+plot(leverage, pch = 19, frame = FALSE, xlab = "Observation", ylab = "Leverage", main = "Leverage Plot")
+
+```
+
+
